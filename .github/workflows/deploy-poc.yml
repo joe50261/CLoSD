@@ -8,6 +8,7 @@ on:
       - "closd/poc/artifacts/**"
       - "closd/poc/fixtures/**"
       - ".github/workflows/deploy-poc.yml"
+      - ".nojekyll"
   workflow_dispatch:
 
 # Only one deploy at a time; cancel in-progress runs on new pushes.
@@ -23,9 +24,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: closd/poc/web
     steps:
       - uses: actions/checkout@v4
 
@@ -35,15 +33,17 @@ jobs:
           cache: npm
           cache-dependency-path: closd/poc/web/package-lock.json
 
-      - run: npm ci
+      - name: npm ci
+        working-directory: closd/poc/web
+        run: npm ci
 
       # Stage artifacts and fixtures into public/ so they're served at
-      # /CLoSD/artifacts/* and /CLoSD/fixtures/* alongside the bundled JS.
-      # Both directories are gitignored at the closd/poc level — they must
-      # have been produced by export_onnx.py / generate_fixtures.py and
-      # either committed under closd/poc/web/public/ directly, or fetched
-      # in CI before this step (out of scope for this workflow today).
+      # /CLoSD/artifacts/* and /CLoSD/fixtures/*. Both source dirs are
+      # gitignored at closd/poc level — must have been produced by
+      # export_onnx.py / generate_fixtures.py and force-committed, or
+      # be fetched in a CI step ahead of this one.
       - name: Stage artifacts and fixtures
+        working-directory: closd/poc/web
         run: |
           mkdir -p public
           if [ -d "../artifacts" ]; then
@@ -62,9 +62,19 @@ jobs:
           fi
 
       - name: Build
+        working-directory: closd/poc/web
         env:
           VITE_BASE: /CLoSD/
         run: npm run build
+
+      # Print what's actually in dist so the artifact contents are visible
+      # in CI logs (helps diagnose path issues like the previous 404).
+      - name: Show dist contents
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la closd/poc/web/dist/
+          echo "---"
+          find closd/poc/web/dist -maxdepth 3 -type f | head -30
 
       - uses: actions/upload-pages-artifact@v3
         with:
