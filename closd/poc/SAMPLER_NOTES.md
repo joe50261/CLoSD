@@ -51,17 +51,17 @@ def forward(self, x, timesteps, y={}):
     # Returns: [B, 263, 1, 20+40]  float32   (model concats prefix internally — see below)
 ```
 
-**Internal behavior we must mirror in TS** (`mdm.py:200-241`):
+**Internal behavior we must mirror in TS** (`mdm.py:200-291`):
 - `target_cond` branch — **skipped** (multi_target_cond=False).
-- `is_prefix_comp` branch (`mdm.py:205-208`) — **active**. Model concatenates `y['prefix']` to `x` along the time dim and pads the mask with 20 ones on the left. So **input to the transformer is 60 frames**, output is 60 frames; the AR sampler keeps only the last 40 with `sample[..., -pred_len:]` (`sampler_util.py:57`).
-- Text branch (`mdm.py:221-237`) — uses `y['text_embed']` if present (cached). If `y.get('text_uncond')==True`, `mask_cond` zeros the text_emb (`mdm.py:156-164`).
+- `is_prefix_comp` branch (`mdm.py:205-208`) — **active**. Model concatenates `y['prefix']` to `x` along the time dim and pads the mask with 20 ones on the left, so **inside** the transformer the sequence is 60 frames. After the transformer, the model strips the prefix back off (`mdm.py:290-291`: `output = output[self.context_len:]`), so **the returned tensor is `[1, 263, 1, 40]`**, not 60.
+- Text branch (`mdm.py:221-237`) — uses `y['text_embed']` if present (cached). If `y.get('text_uncond')==True`, `mask_cond` zeros the text emb (`mdm.py:156-164`).
 
 **Output is x_start**, not epsilon, not (mean, var). `model_mean_type = ModelMeanType.START_X` is hardcoded by `predict_xstart=True` (`model_util.py:80, 102`). FIXED_SMALL/LARGE only changes `posterior_variance` reporting, which DDIM with eta=0 ignores.
 
 **Export shape contract for ONNX** (Day 2):
-- Inputs: `x` `[1, 263, 1, 40]`, `timesteps` `[1]`, `text_embed` `[1, 1, 512]`, `mask` `[1, 1, 1, 40]`, `prefix` `[1, 263, 1, 20]`.
-- Output: `pred_xstart_full` `[1, 263, 1, 60]` (TS will slice `[..., -40:]` itself).
-- We **bypass** the `text_uncond` runtime branch by exporting only the conditional path; for the uncond pass, **TS feeds a zero-vector `text_embed` of shape `[1,1,512]`** (equivalent to the CLIP empty-string output passed through `embed_text` after the `mask_cond` zeroing, see §3).
+- Inputs: `x` `[1, 263, 1, 40]`, `timesteps` `[1]`, `text_embed` `[1, 1, 512]`, `mask` `[1, 1, 1, 40]`, `prefix` `[1, 263, 1, 20]`, `text_uncond_mask` `[1]` float32.
+- Output: `pred_xstart` `[1, 263, 1, 40]` — already trimmed to the predict region.
+- For the CFG uncond pass, set `text_uncond_mask = 1.0` (zeros the text branch after the embed Linear, mirroring `mask_cond(force_mask=True)`); for the cond pass, set it to `0.0`. **No re-tokenization needed for the uncond pass.** This is wired up via a monkey-patched `mask_cond` at export time — see `closd/poc/export_onnx.py`.
 
 ## 3. Text encoder — separate from the trunk
 
@@ -141,38 +141,27 @@ return x[..., -40:]                # only the last 40 are the new prediction
 
 **clip_denoised**: `False` for DiP (`generate.py:201`, `clip_denoised=False` is passed to the sampler). So **no `clamp(-1,1)` on pred_xstart**. Important — clipping would silently corrupt the output for valid HumanML3D ranges that exceed [-1,1].
 
-## 6. Prefix handling inside the denoise loop — gotcha
+## 6. Prefix handling inside the denoise loop
 
-The model concatenates `y['prefix']` (clean, un-noised) with `x` (noisy, in latent diffusion space) before its forward pass (`mdm.py:205-208`). The output is the model's prediction over the **full 60-frame window**.
+The model concatenates `y['prefix']` (clean) with `x` (noisy predict region) internally, runs the transformer over the full 60-frame sequence, then strips the prefix off before returning (`mdm.py:205-208` and `mdm.py:290-291`). So the **caller never sees 60 frames**:
 
-Then DDIM's `_predict_eps_from_xstart` operates on the full 60-frame `x_t` and the full 60-frame `pred_xstart`. Because the prefix is clean (not noised), the model's prediction over the prefix region is essentially "denoise to itself" — but the math still goes through. The `x` tensor we maintain across denoise steps is **60-dim wide**: `x[:, :, :, :20]` is the prefix (kept fixed by reseeding at each step? — no, looking again, the prefix is added inside `forward()` each call, so the **outer `x` tensor is just the 40-frame noisy part. But the model returns 60 frames.** Reconciliation:
+- We pass `x` of shape `[1, 263, 1, 40]` (noisy predict region).
+- We pass `prefix` of shape `[1, 263, 1, 20]` (clean rolling context).
+- Model returns `pred_xstart` of shape `[1, 263, 1, 40]`. No slicing needed in TS.
 
-Looking at `mdm.py:205-208` again:
-```python
-if self.is_prefix_comp:
-    x = torch.cat([y['prefix'], x], dim=-1)            # x becomes 60 frames here
-    y['mask'] = torch.cat([torch.ones(...20...), y['mask']], dim=-1)
-```
-
-So:
-- Outer caller passes `x` of shape `[1,263,1,40]` (noisy predict region only).
-- Model internally concats prefix → 60 frames → transformer → output 60 frames.
-- DDIM step operates on the 40-frame outer `x`. So we slice the model output to its last 40 frames before feeding to `_predict_eps_from_xstart`.
-
-**Corrected TS pseudocode**:
+**TS pseudocode** (verified against `gaussian_diffusion.ddim_sample` and `mdm.forward`):
 
 ```ts
 // x is [1,263,1,40] throughout the denoise loop
-let x = randn([1,263,1,40]);
+let x = randn([1, 263, 1, 40]);
 for (let t = 9; t >= 0; t--) {
-    const predFull = await cfgRun(x, t, prefix, textEmb);       // [1,263,1,60]
-    const predXstart = predFull.slice(-40, axis=time);          // [1,263,1,40]
+    const predXstart = await cfgRun(x, t, prefix, textEmb);     // [1,263,1,40]
     x = ddimStep(x, predXstart, t);                              // operates on 40-frame x
 }
 return x;   // [1,263,1,40] — one AR iteration's prediction
 ```
 
-The mask passed to the model is for the 40-frame predict region; the model expands it internally.
+The mask passed to the model is for the 40-frame predict region only; the model pads 20 ones onto the left internally.
 
 ## 7. Autoregressive loop
 
@@ -265,8 +254,8 @@ function cosineBetas(N: number, maxBeta = 0.999): number[] {
 
 ## 12. Gotchas (don't lose a day to these)
 
-1. **Model output is 60 frames, not 40** — slice `[..., -40:]` before passing to DDIM step.
-2. **`text_uncond` is implemented by zeroing the text embedding inside the ONNX trunk**, so the TS uncond pass just passes `zeros([1,1,512])` instead of the real CLIP output. No re-tokenization.
+1. **Model strips the prefix internally** — output is `[1,263,1,40]`, not 60. No slicing in TS.
+2. **`text_uncond` is implemented inside the ONNX trunk via the `text_uncond_mask` input** (a `[1]` float). Set to `0.0` for the cond pass, `1.0` for the uncond pass. The exported graph monkey-patches `mask_cond` so the runtime tensor drives the zeroing — `text_embed` is the real CLIP output in both passes.
 3. **DDIM eta=0 means no noise term** — the line `mean_pred + nonzero_mask * sigma * noise` reduces to just `mean_pred` with `sigma=0`. Don't forget this when transcribing.
 4. **`clip_denoised=False`** for DiP — do NOT clamp `pred_xstart` to [-1,1]. The HumanML3D feature space exceeds that range and clamping silently corrupts.
 5. **Timestep tensor is int64** in PyTorch ONNX exports. ORT Web requires `BigInt64Array` for int64 inputs — use `new BigInt64Array([BigInt(t)])`, not `Int32Array`.
@@ -274,7 +263,7 @@ function cosineBetas(N: number, maxBeta = 0.999): number[] {
 7. **CLIP tokenization context_length=22** in HumanML3D path; transformers.js may default to 77. Either truncate explicitly or verify the projection is invariant (the `[EOS]` token determines the pooled output, so truncation past the prompt's actual length is usually a no-op — verify on Day 5).
 8. **`autoregressive_include_prefix=False`** for the standard demo — first 20 frames in the output are from the data prefix; user should NOT see them.
 9. **CFG `scale` shape is `[B,1,1,1]`** in PyTorch broadcast. For B=1 it's just a scalar in TS; keep it scalar.
-10. **No learned null token** — the uncond branch zeros the text embedding via `mask_cond`, then passes through the same `embed_text` Linear. The Linear's bias is therefore present in the uncond pass. **This means `zeros([1,1,512])` as the input to the trunk gives a non-zero output (the bias is still applied).** That's fine — it matches Python behavior because Python also zeros after the Linear (`mdm.py:159-163`)... wait, `mask_cond` is called on the output of `embed_text`, so it zeros the post-Linear embedding, not the input. So in TS, the equivalent is zeroing the text embedding **after** any internal projection. Re-check on Day 2 export — easiest fix is to bake the zeroing into the ONNX export by exporting two graphs (cond, uncond) or by adding `text_uncond` as a runtime input multiplier inside the exported graph. Probably simplest: **export with `text_uncond` as a `[1]` bool input** that the exported graph respects.
+10. **No learned null token** — `mask_cond` zeros the text embedding on the **output** side of the `embed_text` Linear (per `mdm.py:233`, default `emb_before_mask=False`). The export script monkey-patches `mask_cond` to apply the runtime `text_uncond_mask` tensor at that exact spot, preserving the original semantics regardless of `emb_before_mask`.
 
 ## 13. References (quick links)
 
