@@ -227,13 +227,146 @@ def fixtures_phase_goal():
 
 
 def fixtures_phase_inbetween():
-    """Phase 2 Day 10-11: in-between editing. To be implemented after Phase 1 ships."""
-    raise NotImplementedError("Phase 2 fixture; implement on Day 10 of the plan.")
+    """Phase 2 Day 10-11: in-between editing. Saves:
+        reference_motion.npy   [1, 263, 1, 196] reference (a Phase 1 output)
+        inpainting_mask.npy    [1, 263, 1, 196] bool, True = preserve
+        edit_in_between/iter{0,1}/* same-shape per-step intermediates
+        edit_in_between/motion_full.npy   [1, 263, 1, 196] final edited motion
+    """
+    out = FIXTURES_DIR / "phase2_inbetween"
+    out.mkdir(parents=True, exist_ok=True)
+
+    model, diffusion, args, model_kwargs = setup_model_and_data()
+    device = next(model.parameters()).device
+
+    # 1. Generate the reference motion via the no-target AR pipeline so we
+    #    have a clean Phase 1 motion to edit. This avoids needing a real
+    #    HumanML3D test sample on disk.
+    from closd.diffusion_planner.utils.sampler_util import AutoRegressiveSampler
+    motion_shape = (1, model.njoints, model.nfeats, args.pred_len)
+    sample_cls = AutoRegressiveSampler(args, diffusion.p_sample_loop, 196)
+    with torch.no_grad():
+        reference_motion = sample_cls.sample(
+            model, motion_shape,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            skip_timesteps=0, init_image=None, progress=False,
+            dump_steps=None, noise=None, const_noise=False, recon_guidance=False,
+        )
+    np.save(out / "reference_motion.npy", reference_motion.cpu().numpy())
+
+    # 2. Build in-between mask: preserve [0, 50) and [150, 196), inpaint [50, 150).
+    start_idx, end_idx = 50, 150
+    inpainting_mask = torch.ones(
+        1, model.njoints, model.nfeats, 196, dtype=torch.bool, device=device
+    )
+    inpainting_mask[..., start_idx:end_idx] = False
+    np.save(out / "inpainting_mask.npy", inpainting_mask.cpu().numpy().astype(bool))
+    np.save(out / "edit_window.npy", np.array([start_idx, end_idx], dtype=np.int32))
+
+    # 3. Re-run the AR sampler with inpainting active. The model_kwargs gain
+    #    inpainting_mask + inpainted_motion which p_mean_variance reads in
+    #    gaussian_diffusion.py:359-365.
+    edit_kwargs = {
+        "y": {
+            **model_kwargs["y"],
+            "inpainting_mask": inpainting_mask,
+            "inpainted_motion": reference_motion,
+        }
+    }
+
+    # Re-init prefix to zeros so the edit run is reproducible
+    edit_kwargs["y"]["prefix"] = torch.zeros(
+        1, model.njoints, model.nfeats, args.context_len, device=device
+    )
+
+    with torch.no_grad():
+        edited = sample_cls.sample(
+            model, motion_shape,
+            clip_denoised=False,
+            model_kwargs=edit_kwargs,
+            skip_timesteps=0, init_image=None, progress=False,
+            dump_steps=None, noise=None, const_noise=False, recon_guidance=False,
+        )
+    np.save(out / "motion_full.npy", edited.cpu().numpy())
+
+    # Sanity: edited motion should equal reference at preserved frames.
+    ref = reference_motion.cpu().numpy()
+    edt = edited.cpu().numpy()
+    err_preserved = np.abs(ref[..., :start_idx] - edt[..., :start_idx]).mean()
+    err_preserved_tail = np.abs(ref[..., end_idx:] - edt[..., end_idx:]).mean()
+    print(f"[fixtures] inbetween: preserved-region MAE = {err_preserved:.2e} (head), "
+          f"{err_preserved_tail:.2e} (tail)")
+    print(f"[fixtures] phase2_inbetween written to {out}")
 
 
 def fixtures_phase_upper():
-    """Phase 2 Day 12: upper-body editing. To be implemented after Phase 1 ships."""
-    raise NotImplementedError("Phase 2 fixture; implement on Day 12 of the plan.")
+    """Phase 2 Day 12: upper-body editing. Same pipeline as inbetween but with
+    a feature-axis mask (HML_LOWER_BODY_MASK) instead of a time-axis mask.
+    """
+    out = FIXTURES_DIR / "phase2_upper"
+    out.mkdir(parents=True, exist_ok=True)
+
+    from closd.diffusion_planner.data_loaders import humanml_utils
+    model, diffusion, args, model_kwargs = setup_model_and_data()
+    device = next(model.parameters()).device
+
+    from closd.diffusion_planner.utils.sampler_util import AutoRegressiveSampler
+    motion_shape = (1, model.njoints, model.nfeats, args.pred_len)
+    sample_cls = AutoRegressiveSampler(args, diffusion.p_sample_loop, 196)
+    with torch.no_grad():
+        reference_motion = sample_cls.sample(
+            model, motion_shape,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            skip_timesteps=0, init_image=None, progress=False,
+            dump_steps=None, noise=None, const_noise=False, recon_guidance=False,
+        )
+    np.save(out / "reference_motion.npy", reference_motion.cpu().numpy())
+
+    # Build upper-body mask: HML_LOWER_BODY_MASK is True for lower-body features.
+    # The edit.py path preserves where mask=True and inpaints where mask=False,
+    # so for "upper-body editing" we use HML_LOWER_BODY_MASK directly (preserves
+    # lower-body, inpaints upper-body).
+    lower_mask = humanml_utils.HML_LOWER_BODY_MASK  # numpy bool [263]
+    np.save(out / "lower_body_mask.npy", lower_mask.astype(bool))
+    inpainting_mask = torch.tensor(lower_mask, dtype=torch.bool, device=device)
+    inpainting_mask = (
+        inpainting_mask.view(1, -1, 1, 1)
+        .expand(1, -1, model.nfeats, 196)
+        .contiguous()
+    )
+
+    edit_kwargs = {
+        "y": {
+            **model_kwargs["y"],
+            "inpainting_mask": inpainting_mask,
+            "inpainted_motion": reference_motion,
+        }
+    }
+    edit_kwargs["y"]["prefix"] = torch.zeros(
+        1, model.njoints, model.nfeats, args.context_len, device=device
+    )
+
+    with torch.no_grad():
+        edited = sample_cls.sample(
+            model, motion_shape,
+            clip_denoised=False,
+            model_kwargs=edit_kwargs,
+            skip_timesteps=0, init_image=None, progress=False,
+            dump_steps=None, noise=None, const_noise=False, recon_guidance=False,
+        )
+    np.save(out / "motion_full.npy", edited.cpu().numpy())
+
+    # Sanity: lower-body features unchanged.
+    ref = reference_motion.cpu().numpy()
+    edt = edited.cpu().numpy()
+    feat_mask = lower_mask  # [263]
+    err_lower = np.abs(
+        ref[:, feat_mask, :, :] - edt[:, feat_mask, :, :]
+    ).mean()
+    print(f"[fixtures] upper: lower-body-feature MAE = {err_lower:.2e}")
+    print(f"[fixtures] phase2_upper written to {out}")
 
 
 def fixtures_phase_invert():

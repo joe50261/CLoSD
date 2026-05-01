@@ -60,6 +60,68 @@ export function epsFromXstart(
   return { data: out, shape: x.shape };
 }
 
+/**
+ * Inpaint mix: at indices where mask > 0, take from `reference`; elsewhere take from `pred`.
+ * Mirrors gaussian_diffusion.py:363:
+ *   model_output = (model_output * ~inpainting_mask) + (inpainted_motion * inpainting_mask)
+ *
+ * Both `pred` and `reference` must have the same shape. `mask` must broadcast
+ * to that shape — we handle two cases for the PoC:
+ *   - exact same shape as pred (the in-between case: mask varies per element)
+ *   - matching feature dim only (mask shape [1, F, 1, 1]; the upper-body case
+ *     where the mask depends only on the joint-feature index, broadcast over
+ *     batch and time)
+ */
+export function inpaintMix(pred: T4, reference: T4, mask: T4): T4 {
+  assertSameShape(pred, reference, "inpaintMix(pred, reference)");
+  const out = new Float32Array(pred.data.length);
+
+  if (sameShape(mask, pred)) {
+    for (let i = 0; i < out.length; i++) {
+      const m = mask.data[i]! > 0 ? 1 : 0;
+      out[i] = pred.data[i]! * (1 - m) + reference.data[i]! * m;
+    }
+    return { data: out, shape: pred.shape };
+  }
+
+  // Try broadcasting on the feature dim. pred is [B, F, J, T]; mask is [1, F, 1, 1].
+  if (
+    pred.shape.length === 4 &&
+    mask.shape.length === 4 &&
+    mask.shape[0] === 1 &&
+    mask.shape[1] === pred.shape[1] &&
+    mask.shape[2] === 1 &&
+    mask.shape[3] === 1
+  ) {
+    const [B, F, J, T] = pred.shape;
+    for (let b = 0; b < B!; b++) {
+      for (let f = 0; f < F!; f++) {
+        const m = mask.data[f]! > 0 ? 1 : 0;
+        for (let j = 0; j < J!; j++) {
+          for (let t = 0; t < T!; t++) {
+            const idx = b * F! * J! * T! + f * J! * T! + j * T! + t;
+            out[idx] = pred.data[idx]! * (1 - m) + reference.data[idx]! * m;
+          }
+        }
+      }
+    }
+    return { data: out, shape: pred.shape };
+  }
+
+  throw new Error(
+    `inpaintMix: unsupported mask shape ${mask.shape.join("x")} ` +
+      `for pred ${pred.shape.join("x")}; expected matching shape or [1,F,1,1] broadcast`,
+  );
+}
+
+function sameShape(a: T4, b: T4): boolean {
+  if (a.shape.length !== b.shape.length) return false;
+  for (let i = 0; i < a.shape.length; i++) {
+    if (a.shape[i] !== b.shape[i]) return false;
+  }
+  return true;
+}
+
 // Mean absolute error between two tensors of the same shape.
 export function mae(a: T4, b: T4): number {
   assertSameShape(a, b, "mae");
