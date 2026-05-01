@@ -2,16 +2,21 @@
 // 4D tensors are stored as Float32Array with explicit shape; we never need
 // general broadcasting so the API is intentionally narrow.
 
+/**
+ * Flat-buffer N-d tensor. Rank is encoded only in `shape` — operations that
+ * require a specific rank (slice/concat) runtime-check it. Most consumers
+ * use 4D motion tensors [B, J, F, T]; text embeddings are 3D [1, B, C].
+ */
 export interface T4 {
   data: Float32Array;
-  shape: readonly [number, number, number, number];
+  shape: readonly number[];
 }
 
 export function numel(shape: readonly number[]): number {
   return shape.reduce((a, b) => a * b, 1);
 }
 
-export function zeros(shape: T4["shape"]): T4 {
+export function zeros(shape: readonly number[]): T4 {
   return { data: new Float32Array(numel(shape)), shape };
 }
 
@@ -66,16 +71,19 @@ export function mae(a: T4, b: T4): number {
 }
 
 // Slice along the last axis. Negative `start` counts from the end.
-// Used by AR loop: prefix = sample[..., -context_len:]
+// Used by AR loop: prefix = sample[..., -context_len:]. Requires rank 4.
 export function sliceLastAxis(t: T4, start: number, end?: number): T4 {
-  const T = t.shape[3];
+  if (t.shape.length !== 4) {
+    throw new Error(`sliceLastAxis: expected rank 4, got ${t.shape.length}`);
+  }
+  const T = t.shape[3]!;
   const s = start < 0 ? T + start : start;
   const e = end === undefined ? T : end < 0 ? T + end : end;
   if (s < 0 || e > T || s >= e) {
     throw new Error(`sliceLastAxis: bad range [${s},${e}) for T=${T}`);
   }
   const newT = e - s;
-  const [B, J, F] = [t.shape[0], t.shape[1], t.shape[2]];
+  const [B, J, F] = [t.shape[0]!, t.shape[1]!, t.shape[2]!];
   const out = new Float32Array(B * J * F * newT);
   // Source strides
   const strideF = T;
@@ -99,16 +107,19 @@ export function sliceLastAxis(t: T4, start: number, end?: number): T4 {
   return { data: out, shape: [B, J, F, newT] };
 }
 
-// Concat two T4 along the last axis.
+// Concat two T4 along the last axis. Requires rank 4 with matching leading dims.
 export function concatLastAxis(a: T4, b: T4): T4 {
+  if (a.shape.length !== 4 || b.shape.length !== 4) {
+    throw new Error(`concatLastAxis: expected rank 4, got ${a.shape.length}/${b.shape.length}`);
+  }
   if (a.shape[0] !== b.shape[0] || a.shape[1] !== b.shape[1] || a.shape[2] !== b.shape[2]) {
     throw new Error(
       `concatLastAxis: leading dims must match (${a.shape} vs ${b.shape})`,
     );
   }
-  const [B, J, F] = [a.shape[0], a.shape[1], a.shape[2]];
-  const Ta = a.shape[3];
-  const Tb = b.shape[3];
+  const [B, J, F] = [a.shape[0]!, a.shape[1]!, a.shape[2]!];
+  const Ta = a.shape[3]!;
+  const Tb = b.shape[3]!;
   const T = Ta + Tb;
   const out = new Float32Array(B * J * F * T);
   for (let bi = 0; bi < B; bi++) {
@@ -158,7 +169,7 @@ export class SeededRng {
   }
 }
 
-export function randnT4(shape: T4["shape"], rng: SeededRng): T4 {
+export function randnT4(shape: readonly number[], rng: SeededRng): T4 {
   const t = zeros(shape);
   rng.randn(t.data);
   return t;
