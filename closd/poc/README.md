@@ -50,6 +50,42 @@ Each tool reuses Phase 1's runtime and adds a `--phase <name>` to `generate_fixt
 
 The Phase 2 functions in `generate_fixtures.py` currently `raise NotImplementedError` and will be filled in on the relevant days.
 
+## Deployment to GitHub Pages
+
+`.github/workflows/deploy-poc.yml` builds and deploys `closd/poc/web/` to GitHub Pages on every push to `main` (or the active feature branch) that touches `closd/poc/web/**`, `closd/poc/artifacts/**`, or `closd/poc/fixtures/**`. The deployed URL is `https://joe50261.github.io/CLoSD/`.
+
+### One-time repo setup
+
+In **Settings → Pages → Build and deployment**: set **Source = "GitHub Actions"**. The workflow uses `actions/deploy-pages@v4` and won't deploy until this is enabled.
+
+### Providing artifacts and fixtures
+
+The workflow expects:
+
+- `closd/poc/artifacts/dip_no_target.fp16.onnx` — exported model
+- `closd/poc/fixtures/phase1_core/*.npy` — parity reference tensors
+
+Both directories are listed in `closd/poc/.gitignore`, so the workflow won't find them unless one of:
+
+1. **Commit them directly** (override `.gitignore` for those paths). FP16 ONNX is ~50 MB which fits under GitHub's 100 MB single-file limit; fixtures are ~5 MB total. Simple, but adds permanent repo size.
+2. **Use Git LFS** for the `.onnx` file. Better for repo hygiene; needs LFS quota.
+3. **Add a CI step** that downloads the ONNX from a HuggingFace release or GitHub release before the build. Cleanest separation, but adds complexity.
+
+For the PoC, option 1 is fine. After running `export_onnx.py` + `generate_fixtures.py` locally, force-add and commit:
+
+```bash
+git add -f closd/poc/artifacts/dip_no_target.fp16.onnx closd/poc/artifacts/dip_no_target.args.json
+git add -f closd/poc/fixtures/phase1_core/
+git commit -m "poc: add Phase 1 artifacts and fixtures"
+git push
+```
+
+Without those files committed, the workflow still succeeds and the page deploys, but the parity harness will 404 on the model fetch.
+
+### Manual deploy
+
+`Actions → Deploy PoC to GitHub Pages → Run workflow` triggers a deploy without a commit.
+
 ## Final deliverable (end of Day 14)
 
-A static site (`closd/poc/web/dist/`) plus the exported `.onnx` weights — served by any static host. End users open a URL and run all Phase 1 + Phase 2 tools in their browser. **No Python at runtime.**
+A static site (`closd/poc/web/dist/`) plus the exported `.onnx` weights — served by GitHub Pages or any static host. End users open the URL and run all Phase 1 + Phase 2 tools in their browser. **No Python at runtime.**

@@ -27,11 +27,12 @@ runBtn.addEventListener("click", async () => {
   logEl.textContent = "";
   log("starting parity run");
   try {
+    // BASE_URL is "/" in dev and "/CLoSD/" on GitHub Pages — Vite injects it
+    // from the `base` config at build time.
+    const base = import.meta.env.BASE_URL;
     const report = await runParity({
-      // Vite serves static files from /public; we drop fixtures/ + artifacts/
-      // there at build time (or symlink locally for dev).
-      fixturesBaseUrl: "/fixtures/phase1_core",
-      modelUrl: "/artifacts/dip_no_target.fp16.onnx",
+      fixturesBaseUrl: `${base}fixtures/phase1_core`,
+      modelUrl: `${base}artifacts/dip_no_target.fp16.onnx`,
       seed: 10,
       threshold: 5e-3,
       onProgress: log,

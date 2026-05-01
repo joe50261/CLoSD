@@ -1,0 +1,81 @@
+name: Deploy PoC to GitHub Pages
+
+on:
+  push:
+    branches: [main, "claude/project-overview-docs-FScIt"]
+    paths:
+      - "closd/poc/web/**"
+      - "closd/poc/artifacts/**"
+      - "closd/poc/fixtures/**"
+      - ".github/workflows/deploy-poc.yml"
+  workflow_dispatch:
+
+# Only one deploy at a time; cancel in-progress runs on new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: closd/poc/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: closd/poc/web/package-lock.json
+
+      - run: npm ci
+
+      # Stage artifacts and fixtures into public/ so they're served at
+      # /CLoSD/artifacts/* and /CLoSD/fixtures/* alongside the bundled JS.
+      # Both directories are gitignored at the closd/poc level — they must
+      # have been produced by export_onnx.py / generate_fixtures.py and
+      # either committed under closd/poc/web/public/ directly, or fetched
+      # in CI before this step (out of scope for this workflow today).
+      - name: Stage artifacts and fixtures
+        run: |
+          mkdir -p public
+          if [ -d "../artifacts" ]; then
+            cp -rL ../artifacts public/artifacts
+            echo "Staged artifacts:"
+            ls -lh public/artifacts
+          else
+            echo "No artifacts/ directory — page will 404 on .onnx fetch."
+          fi
+          if [ -d "../fixtures" ]; then
+            cp -rL ../fixtures public/fixtures
+            echo "Staged fixtures:"
+            find public/fixtures -maxdepth 2 -type d
+          else
+            echo "No fixtures/ directory — page will 404 on .npy fetch."
+          fi
+
+      - name: Build
+        env:
+          VITE_BASE: /CLoSD/
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: closd/poc/web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
