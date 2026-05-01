@@ -1,0 +1,10 @@
+{
+  "synthetic": true,
+  "context_len": 20,
+  "pred_len": 40,
+  "diffusion_steps": 10,
+  "latent_dim": 64,
+  "layers": 2,
+  "feature_dim": 263,
+  "note": "Random-weights synth model \u2014 see closd/poc/synth_trunk.py docstring."
+}
