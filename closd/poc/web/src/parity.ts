@@ -10,7 +10,12 @@ import { autoregressiveSample } from "./ar_loop.js";
 import { runCfgStep } from "./cfg.js";
 import { loadTrunk, type TrunkSession } from "./ort_setup.js";
 import { DEFAULT_CONFIG, buildSchedule, ddimStepEta0 } from "./scheduler.js";
-import { loadTextEncoder, type TextEncoder } from "./text_encoder.js";
+import {
+  loadBertTextEncoder,
+  loadTextEncoder,
+  type BertTextEncoder,
+  type TextEncoder,
+} from "./text_encoder.js";
 import { mae, type T4 } from "./tensor.js";
 
 export interface ParityCheck {
@@ -107,17 +112,13 @@ export async function runParity(
   const log = opts.onProgress ?? (() => {});
   const threshold = opts.threshold ?? 5e-3;
 
-  // Loading the text encoder pulls ~80 MB of CLIP weights from the HF CDN.
-  // Make it lazy + non-fatal: if it fails we can still run the rest of the
-  // harness against the saved text_embed fixture. (Useful for offline /
-  // synth deploys where the saved fixture is the source of truth anyway.)
-  let encoder: TextEncoder | null = null;
-  log("loading text encoder…");
-  try {
-    encoder = await loadTextEncoder({ device: "webgpu" });
-  } catch (err) {
-    log(`text encoder unavailable: ${err instanceof Error ? err.message : err}`);
-  }
+  // Loading a text encoder pulls 60–80 MB of weights from the HF CDN. We don't
+  // know yet whether the fixture is CLIP- or BERT-shape, so defer encoder
+  // selection until after we've fetched text_embed.npy below. Both paths are
+  // lazy + non-fatal: if the encoder load fails we still run the rest of the
+  // harness against the saved fixture.
+  let encoderClip: TextEncoder | null = null;
+  let encoderBert: BertTextEncoder | null = null;
 
   log("loading ONNX trunk on WebGPU…");
   const session = await loadTrunk({ modelUrl: opts.modelUrl });
@@ -147,54 +148,111 @@ export async function runParity(
       refTextMask = { data: new Float32Array(tText), shape: [1, tText] };
     }
 
-    // The browser-side text encoder is currently CLIP (transformers.js,
-    // Xenova/clip-vit-base-patch32, 512-d pooled output). The shipped DiP
-    // checkpoints use DistilBERT (768-d sequence). If the fixture's
-    // text_embed seq dim > 1 OR feature dim ≠ 512, the encoders disagree
-    // and we just record "skipped"; the rest of the harness still runs
-    // using the saved fixture as ground truth.
+    // Pick the encoder to match the fixture. Shipped DiP checkpoints are
+    // DistilBERT (D=768, T_text variable); legacy synth fixtures are CLIP
+    // (D=512, T_text=1). The harness handles both: if the encoder load fails
+    // (offline / no HF), we record "skipped" and proceed using the saved
+    // fixture as ground truth so per-step parity still runs.
     let textEncoderCheck: ParityCheck;
     const fixtureIsBert =
       refTextEmbed.shape.length === 3 &&
       (refTextEmbed.shape[0]! > 1 || refTextEmbed.shape[2] === 768);
-    if (encoder && !fixtureIsBert) {
+
+    if (fixtureIsBert) {
+      log("loading DistilBERT text encoder…");
       try {
-        log("checking CLIP text embedding…");
-        const browserTextEmbed = await encoder.encode(promptText.trim());
-        textEncoderCheck = {
-          name: "text_embed (CLIP)",
-          mae: mae(refTextEmbed, browserTextEmbed),
-          threshold,
-          passed: false,
-        };
-        textEncoderCheck.passed = textEncoderCheck.mae < threshold;
+        encoderBert = await loadBertTextEncoder({ device: "webgpu" });
       } catch (err) {
-        log(`CLIP check skipped: ${err instanceof Error ? err.message : err}`);
+        log(`BERT encoder unavailable: ${err instanceof Error ? err.message : err}`);
+      }
+      if (encoderBert) {
+        try {
+          log("checking DistilBERT text embedding…");
+          const browser = await encoderBert.encode(promptText.trim());
+          // Sequence length depends on the tokenizer; if the browser tokenizer
+          // and the Python tokenizer disagree on T_text we can't compare
+          // element-wise. Bail out informatively rather than producing a
+          // misleading huge MAE.
+          if (browser.embed.shape[0] !== refTextEmbed.shape[0]) {
+            const msg = `T_text mismatch: browser=${browser.embed.shape[0]} fixture=${refTextEmbed.shape[0]}`;
+            log(msg);
+            textEncoderCheck = {
+              name: `text_embed (BERT) — ${msg}`,
+              mae: NaN,
+              threshold,
+              passed: false,
+            };
+          } else {
+            const embedMae = mae(refTextEmbed, browser.embed);
+            const maskMae = mae(refTextMask, browser.paddingMask);
+            textEncoderCheck = {
+              name: "text_embed (BERT)",
+              mae: embedMae,
+              threshold,
+              passed: embedMae < threshold,
+            };
+            // The padding mask is a {0,1} tensor — it must match exactly.
+            // Surface it as its own check so we can tell whether a regression
+            // is in the embedding values vs the tokenizer's pad behavior.
+            checks.push({
+              name: "text_mask (BERT)",
+              mae: maskMae,
+              threshold: 1e-6,
+              passed: maskMae < 1e-6,
+            });
+          }
+        } catch (err) {
+          log(`BERT check skipped: ${err instanceof Error ? err.message : err}`);
+          textEncoderCheck = {
+            name: "text_embed (BERT) — skipped",
+            mae: NaN,
+            threshold,
+            passed: true,
+          };
+        }
+      } else {
         textEncoderCheck = {
-          name: "text_embed (CLIP) — skipped",
+          name: "text_embed (BERT) — encoder unavailable",
           mae: NaN,
           threshold,
           passed: true,
         };
       }
-    } else if (fixtureIsBert) {
-      log(
-        "fixture is BERT-shape (D=768 or T_text>1); CLIP browser check skipped " +
-          "until DistilBERT is wired in",
-      );
-      textEncoderCheck = {
-        name: "text_embed — fixture is BERT, browser CLIP comparison skipped",
-        mae: NaN,
-        threshold,
-        passed: true,
-      };
     } else {
-      textEncoderCheck = {
-        name: "text_embed (CLIP) — encoder unavailable",
-        mae: NaN,
-        threshold,
-        passed: true,
-      };
+      log("loading CLIP text encoder…");
+      try {
+        encoderClip = await loadTextEncoder({ device: "webgpu" });
+      } catch (err) {
+        log(`CLIP encoder unavailable: ${err instanceof Error ? err.message : err}`);
+      }
+      if (encoderClip) {
+        try {
+          log("checking CLIP text embedding…");
+          const browserTextEmbed = await encoderClip.encode(promptText.trim());
+          const m = mae(refTextEmbed, browserTextEmbed);
+          textEncoderCheck = {
+            name: "text_embed (CLIP)",
+            mae: m,
+            threshold,
+            passed: m < threshold,
+          };
+        } catch (err) {
+          log(`CLIP check skipped: ${err instanceof Error ? err.message : err}`);
+          textEncoderCheck = {
+            name: "text_embed (CLIP) — skipped",
+            mae: NaN,
+            threshold,
+            passed: true,
+          };
+        }
+      } else {
+        textEncoderCheck = {
+          name: "text_embed (CLIP) — encoder unavailable",
+          mae: NaN,
+          threshold,
+          passed: true,
+        };
+      }
     }
     checks.push(textEncoderCheck);
 
@@ -330,7 +388,8 @@ export async function runParity(
       executionProvider: session.executionProvider,
     };
   } finally {
-    encoder?.release();
+    encoderClip?.release();
+    encoderBert?.release();
     session.release();
     log(`done in ${(performance.now() - t0).toFixed(0)}ms`);
   }

@@ -1,27 +1,40 @@
-// CLIP text encoder via @huggingface/transformers (transformers.js).
+// Browser text encoders via @huggingface/transformers (transformers.js).
 //
-// Why this isn't in the ONNX trunk: CLIP is a separate model with its own
-// tokenizer, weights, and projection. Running it in the browser via the
-// transformers.js pipeline saves us re-implementing tokenization and pulling
-// CLIP weights into our ONNX bundle.
+// Why this isn't in the ONNX trunk: the text encoder is a separate model with
+// its own tokenizer, weights, and projection. Running it in the browser via
+// transformers.js saves us re-implementing tokenization and pulling those
+// weights into our ONNX bundle.
 //
-// Python reference (closd/diffusion_planner/model/mdm.py:166-181):
-//   tokens = clip.tokenize(text, context_length=22, truncate=True)  # [bs, 22]
-//   tokens = pad_with_zeros_to(tokens, 77)                          # [bs, 77]
-//   text_embed = clip_model.encode_text(tokens).float().unsqueeze(0) # [1, bs, 512]
+// Two flavors are supported, matching the two text-encoder branches in
+// closd/diffusion_planner/model/mdm.py:
 //
-// transformers.js path:
-//   tokenizer(text, { padding: 'max_length', max_length: 77, truncation: true })
-//   model(tokens) -> .text_embeds  # [bs, 512]   (or .pooler_output, varies by model)
-//   reshape -> [1, bs, 512]
+//   1. CLIP (mdm.py:166-181, text_encoder_type == "clip"):
+//        tokens = clip.tokenize(text, context_length=22, truncate=True)  # [bs, 22]
+//        tokens = pad_with_zeros_to(tokens, 77)                          # [bs, 77]
+//        text_embed = clip_model.encode_text(tokens).unsqueeze(0)        # [1, bs, 512]
+//      transformers.js id: Xenova/clip-vit-base-patch32
 //
-// The HF model id Xenova/clip-vit-base-patch32 ships pre-converted ONNX weights
-// for transformers.js with WebGPU support.
+//   2. DistilBERT (mdm.py:183-190, text_encoder_type == "bert"):
+//        out, mask = bert(text)                # last_hidden_state [bs, T_text, 768], attn_mask [bs, T_text]
+//        out = out.permute(1, 0, 2)            # [T_text, bs, 768]
+//        mask = ~mask                          # True = padding (PyTorch MHA convention)
+//        return out, mask
+//      transformers.js id: Xenova/distilbert-base-uncased
+//
+// Both shipped DiP checkpoints (no-target, multi-target) use DistilBERT, so the
+// BERT path is the production code path. The CLIP path is kept around for
+// backwards compatibility with older synth fixtures and any future CLIP-trained
+// checkpoints.
 
-import { AutoTokenizer, CLIPTextModelWithProjection } from "@huggingface/transformers";
+import {
+  AutoModel,
+  AutoTokenizer,
+  CLIPTextModelWithProjection,
+} from "@huggingface/transformers";
 import type { T4 } from "./tensor.js";
 
 const MODEL_ID = "Xenova/clip-vit-base-patch32";
+const BERT_MODEL_ID = "Xenova/distilbert-base-uncased";
 // CLIP's standard context length. The DiP-side context_length=22 only affects
 // truncation; the actual CLIP forward is always 77 tokens.
 const TOKEN_MAX_LEN = 77;
@@ -149,4 +162,94 @@ function padTensor(
     }
   }
   return { data: newData, dims: [bs, targetLen] };
+}
+
+// ---------------------------------------------------------------------------
+// DistilBERT text encoder (production path for shipped DiP checkpoints).
+// ---------------------------------------------------------------------------
+
+export interface BertTextEncoderOutput {
+  /** last_hidden_state permuted to seq-first: [T_text, 1, 768]. */
+  embed: T4;
+  /** Padding mask, True (1.0) = padding token. Shape [1, T_text]. Stored as
+   *  Float32Array because the ONNX trunk expects it as a tensor we can compare
+   *  against the .npy fixture (which fetchNpy decodes bool→float32). */
+  paddingMask: T4;
+}
+
+export interface BertTextEncoder {
+  /** Encode a single text prompt. T_text varies with the prompt length. */
+  encode(text: string): Promise<BertTextEncoderOutput>;
+  release(): void;
+}
+
+export interface BertTextEncoderOptions {
+  device?: "webgpu" | "wasm";
+  modelId?: string;
+}
+
+export async function loadBertTextEncoder(
+  opts: BertTextEncoderOptions = {},
+): Promise<BertTextEncoder> {
+  const modelId = opts.modelId ?? BERT_MODEL_ID;
+  const device = opts.device ?? "webgpu";
+
+  const tokenizer = await AutoTokenizer.from_pretrained(modelId);
+  const model = await AutoModel.from_pretrained(modelId, {
+    device,
+    dtype: "fp32",
+  });
+
+  const encode = async (text: string): Promise<BertTextEncoderOutput> => {
+    // bs=1, no padding: BERT pads to longest in batch (mdm.py:28 generate_fixtures
+    // single-prompt run produces tokens with no padding). T_text = number of tokens
+    // including [CLS] and [SEP].
+    const tokens = tokenizer(text, {
+      padding: false,
+      truncation: false,
+      return_tensors: "pt",
+    });
+
+    const out = await model(tokens);
+    const hidden = (out as any).last_hidden_state;
+    if (!hidden) {
+      throw new Error("BERT model output missing last_hidden_state field");
+    }
+    const dims = hidden.dims as number[];
+    if (dims.length !== 3 || dims[0] !== 1) {
+      throw new Error(`unexpected last_hidden_state shape ${dims.join("x")}`);
+    }
+    const tText = dims[1]!;
+    const dTxt = dims[2]!;
+    // last_hidden_state ships as Float32Array [bs=1, T_text, D]. The Python
+    // reference permutes to [T_text, bs, D]; with bs=1 the underlying memory
+    // layout is identical, so we just relabel the shape.
+    const embedData = new Float32Array(hidden.data as Float32Array);
+
+    // attention_mask is a BigInt64Array (or Int32Array depending on
+    // transformers.js version) of shape [1, T_text]. Invert per mdm.py:189
+    // so True = padding, then store as float32 to match the .npy fixture
+    // layout fetched by parity.ts.
+    const attnSrc = (tokens as any).attention_mask;
+    if (!attnSrc) throw new Error("tokenizer output missing attention_mask");
+    const attnLen = attnSrc.dims[1] ?? attnSrc.dims[attnSrc.dims.length - 1];
+    if (attnLen !== tText) {
+      throw new Error(
+        `attention_mask length ${attnLen} != hidden T_text ${tText}`,
+      );
+    }
+    const paddingMaskData = new Float32Array(tText);
+    for (let i = 0; i < tText; i++) {
+      // attention_mask: 1 = real token, 0 = padding. Inverted: 1 = padding.
+      const v = Number(attnSrc.data[i]);
+      paddingMaskData[i] = v === 0 ? 1 : 0;
+    }
+
+    return {
+      embed: { data: embedData, shape: [tText, 1, dTxt] },
+      paddingMask: { data: paddingMaskData, shape: [1, tText] },
+    };
+  };
+
+  return { encode, release: () => model.dispose?.() };
 }
