@@ -54,7 +54,12 @@ export interface LoadOptions {
 export async function loadTrunk(opts: LoadOptions): Promise<TrunkSession> {
   // Default to WebGPU only — we want hard failure if WebGPU is unavailable,
   // not a silent fallback to WASM. Plan §"Loads" makes this a go/no-go gate.
-  const eps = opts.executionProviders ?? ["webgpu"];
+  // Override via `?ep=wasm` query string for diagnostic A/B against WebGPU.
+  const queryEp = new URLSearchParams(globalThis.location?.search ?? "").get(
+    "ep",
+  );
+  const eps =
+    opts.executionProviders ?? (queryEp === "wasm" ? ["wasm"] : ["webgpu"]);
 
   const session = await ort.InferenceSession.create(opts.modelUrl, {
     executionProviders: eps,
