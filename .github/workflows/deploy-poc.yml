@@ -1,14 +1,16 @@
 name: Deploy PoC to GitHub Pages
 
 on:
+  # Pages source is "Deploy from a branch / root", which means GitHub also
+  # auto-runs its pages-build-deployment workflow on every push. Both that
+  # workflow and this one call actions/deploy-pages@v4 — they race, and the
+  # one that completes LAST wins the deploy. If we use a paths filter and
+  # the touched files don't match it, only GitHub's auto workflow runs and
+  # serves the (no-index.html) branch root → site 404s. The fix is to drop
+  # the paths filter so this workflow runs on every push and reliably
+  # produces the dist override after GitHub's auto workflow.
   push:
     branches: [main, "claude/project-overview-docs-FScIt"]
-    paths:
-      - "closd/poc/web/**"
-      - "closd/poc/artifacts/**"
-      - "closd/poc/fixtures/**"
-      - ".github/workflows/deploy-poc.yml"
-      - ".nojekyll"
   workflow_dispatch:
 
 # Only one deploy at a time; cancel in-progress runs on new pushes.
