@@ -4,6 +4,11 @@
 
 import { formatReport, runParity } from "./parity.js";
 
+// Build stamp — Vite inlines this at compile time so we can confirm in the
+// browser which build is running (helps diagnose stale-cache parity runs).
+declare const __BUILD_STAMP__: string;
+const BUILD_STAMP = typeof __BUILD_STAMP__ !== "undefined" ? __BUILD_STAMP__ : "dev";
+
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`#${id} not in DOM`);
@@ -21,10 +26,14 @@ function log(msg: string): void {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+log(`build: ${BUILD_STAMP}`);
+console.log("CLoSD harness build:", BUILD_STAMP);
+
 runBtn.addEventListener("click", async () => {
   runBtn.disabled = true;
   resultEl.textContent = "";
   logEl.textContent = "";
+  log(`build: ${BUILD_STAMP}`);
   log("starting parity run");
   try {
     // BASE_URL is "/" in dev and "/CLoSD/" on GitHub Pages — Vite injects it
