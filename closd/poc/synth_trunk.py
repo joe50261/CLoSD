@@ -1,16 +1,28 @@
 """
-Synthetic DiP trunk for end-to-end PoC infrastructure validation.
+Synthetic DiP trunk — LEGACY shape (CLIP / 512-d / six inputs).
 
-WHY THIS EXISTS
+SUPERSEDED. The real DiP artifacts have been exported and committed to
+`closd/poc/artifacts/`, and they use a DIFFERENT ONNX contract: the real
+checkpoints have `text_encoder_type="bert"`, so the trunk takes a 768-dim
+`text_embed` plus a separate `text_mask` (seven inputs total, dynamic T_text).
+See `closd/poc/export_onnx.py` and `closd/poc/SAMPLER_NOTES.md` §3 for the
+current contract.
+
+This file is kept for reference of the original CLIP-shape PoC scaffolding.
+**Do not regenerate `closd/poc/artifacts/` from this module — it would
+clobber the real-DiP ONNX with random weights and the wrong shape.**
+
+WHY THIS EXISTED
   The real DiP checkpoint and CLIP weights live on HuggingFace + OpenAI's
-  CDN, both of which are blocked by the sandbox where the deploy automation
-  runs. Without those weights we can't run the real export.
+  CDN, both of which were blocked by the sandbox where the deploy automation
+  ran. Without those weights we couldn't run the real export.
 
-  This module builds a SHAPE-COMPATIBLE, RANDOMLY-WEIGHTED transformer with
-  the same six-input ONNX contract as export_onnx.py's TrunkWrapper. The
-  resulting ONNX is structurally a real DiP model — it concatenates prefix,
-  has a transformer encoder, strips the prefix from the output, predicts
-  x_start over the 40-frame predict region. Just the weights are random.
+  This module built a SHAPE-COMPATIBLE, RANDOMLY-WEIGHTED transformer with
+  the original six-input ONNX contract. The resulting ONNX was structurally
+  a real DiP model — it concatenated prefix, had a transformer encoder,
+  stripped the prefix from the output, predicted x_start over the 40-frame
+  predict region. Just the weights were random AND the contract was based
+  on the (incorrect) assumption that the checkpoint used CLIP.
 
 WHAT IT VALIDATES (when paired with synth_fixtures.py)
   - The ONNX export pipeline runs end-to-end.
@@ -305,9 +317,27 @@ def generate_fixtures(out_dir: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Legacy synth-DiP exporter. Will refuse to run unless --force is given, "
+            "since clobbering the real-DiP artifacts in closd/poc/artifacts/ would "
+            "break the deployed parity harness."
+        )
+    )
     parser.add_argument("--mode", choices=["export", "fixtures", "all"], default="all")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Required to actually run; otherwise we exit early to protect real artifacts.",
+    )
     args = parser.parse_args()
+    if not args.force:
+        print(
+            "[synth] refusing to run without --force; this script writes the *legacy* "
+            "CLIP-shape ONNX which is incompatible with the real DiP checkpoints. "
+            "Use closd/poc/export_onnx.py instead."
+        )
+        return
 
     onnx_path = ARTIFACTS_DIR / "dip_no_target.onnx"
     fixtures_path = FIXTURES_DIR / "phase1_core"

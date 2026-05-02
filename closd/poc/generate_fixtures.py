@@ -8,7 +8,11 @@ extend it for Phase 2 tools (Days 8-14).
 
 Phase 1 fixtures (closd/poc/fixtures/phase1_core/):
   prompt.txt              the text prompt used
-  text_embed.npy          [1, 1, 512] cached CLIP encoding of the prompt
+  text_embed.npy          [T_text, 1, D_txt] cached text-encoder hidden states
+                          For DiP no-target / multi-target: D_txt=768 (DistilBERT),
+                          T_text varies with prompt (BERT pads to longest in batch).
+  text_mask.npy           [1, T_text] bool. True = padding token (ignore).
+                          Only present when text encoder returns a tuple (BERT).
   prefix.npy              [1, 263, 1, 20] initial AR prefix (from data, fixed seed)
   mask.npy                [1, 1, 1, 40] validity mask (all ones for 40 valid frames)
   x_T_iter0.npy           [1, 263, 1, 40] initial noise for iter 0
@@ -131,7 +135,16 @@ def fixtures_phase_core():
 
     # Save invariants
     (out / "prompt.txt").write_text(PROMPT)
-    np.save(out / "text_embed.npy", model_kwargs["y"]["text_embed"].cpu().numpy())
+    text_embed_cached = model_kwargs["y"]["text_embed"]
+    if isinstance(text_embed_cached, tuple):
+        # BERT path: (last_hidden_state[T_text, 1, 768], attention_mask[1, T_text] bool).
+        # mdm.py:189 inverts the mask before returning, so True here = padding.
+        enc, tmask = text_embed_cached
+        np.save(out / "text_embed.npy", enc.cpu().numpy())
+        np.save(out / "text_mask.npy", tmask.cpu().numpy())
+    else:
+        # CLIP path: single pooled token [1, 1, 512].
+        np.save(out / "text_embed.npy", text_embed_cached.cpu().numpy())
     np.save(out / "prefix.npy", model_kwargs["y"]["prefix"].cpu().numpy())
     np.save(out / "mask.npy", model_kwargs["y"]["mask"].cpu().numpy())
 

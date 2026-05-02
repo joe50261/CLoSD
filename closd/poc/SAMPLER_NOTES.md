@@ -25,8 +25,9 @@ Config (from checkpoint `args.json`, confirmed against parser defaults and model
 | `pred_len` | `40` | AR predict-window length. |
 | `multi_target_cond` | `False` | No target-joint head; the no-target ckpt skips that branch entirely. |
 | `dataset` | `"humanml"` | → `njoints=263, nfeats=1, data_rep='hml_vec'` (`model_util.py:43-47`). |
-| `arch` | `"trans_enc"` (typical) | Transformer encoder-only (vs `trans_dec`). Confirm at export time. |
-| `emb_policy` | `"concat"` (parser default) | How `time_emb + text_emb` are fused (concat vs add). Confirm at export time. |
+| `arch` | `"trans_dec"` (verified) | Transformer encoder-decoder; cross-attends over text tokens. |
+| `emb_policy` | `"add"` (verified) | `time_emb` is broadcast-added to `text_emb` along the BERT seq dim. |
+| `text_encoder_type` | `"bert"` (verified) | DistilBERT, **not** CLIP — `clip_dim=768`. See §3. |
 
 **Inference defaults** (`generate_args` / `parser_util.py:229`):
 - `guidance_param = 7.5`
@@ -43,12 +44,15 @@ def forward(self, x, timesteps, y={}):
     # x:         [B, 263, 1, T_pred]    float32   (T_pred = pred_len = 40)
     # timesteps: [B]                    int64     (values 0..9 for the 10-step model)
     # y: dict, keys actually used by the no-target ckpt:
-    #   text_embed:  [1, B, 512] float32  (cached CLIP output; pre-encoded — see §3)
+    #   text_embed:  EITHER tensor [1, B, D_txt]              (CLIP path, D_txt=512)
+    #                 OR tuple (last_hidden_state[T_text, B, 768], attention_mask[B, T_text] bool)
+    #                 for the BERT path that the shipped DiP checkpoints actually use.
+    #                 Cached and reused across denoise steps + CFG passes — see §3.
     #   text_uncond: bool                 (CFG uncond pass flag; see §4)
     #   mask:        [B, 1, 1, T_pred]    bool   (1=valid frame; padding=0)
     #   prefix:      [B, 263, 1, 20]      float32  (rolling context from AR loop)
     #   lengths:     [B] int              (motion length; only used in inv_transform path)
-    # Returns: [B, 263, 1, 20+40]  float32   (model concats prefix internally — see below)
+    # Returns: [B, 263, 1, T_pred]  float32   (mdm strips the prefix back off — see below)
 ```
 
 **Internal behavior we must mirror in TS** (`mdm.py:200-291`):
@@ -59,20 +63,33 @@ def forward(self, x, timesteps, y={}):
 **Output is x_start**, not epsilon, not (mean, var). `model_mean_type = ModelMeanType.START_X` is hardcoded by `predict_xstart=True` (`model_util.py:80, 102`). FIXED_SMALL/LARGE only changes `posterior_variance` reporting, which DDIM with eta=0 ignores.
 
 **Export shape contract for ONNX** (Day 2):
-- Inputs: `x` `[1, 263, 1, 40]`, `timesteps` `[1]`, `text_embed` `[1, 1, 512]`, `mask` `[1, 1, 1, 40]`, `prefix` `[1, 263, 1, 20]`, `text_uncond_mask` `[1]` float32.
+- Inputs: `x` `[1, 263, 1, 40]`, `timesteps` `[1]`, `text_embed` `[T_text, 1, 768]`, `text_mask` `[1, T_text]` bool, `mask` `[1, 1, 1, 40]`, `prefix` `[1, 263, 1, 20]`, `text_uncond_mask` `[1]` float32.
+- `T_text` is a **dynamic axis** — the BERT tokenizer pads to the longest prompt in the batch. For B=1 it's just the prompt's tokenized length (e.g. 6 for "a person walks forward").
+- `text_mask`: `True` means "padding token, mask it out in cross-attention". The BERT encoder returns the inverse and `mdm.py:189` flips it before the model uses it; the ONNX trunk consumes the already-flipped version.
 - Output: `pred_xstart` `[1, 263, 1, 40]` — already trimmed to the predict region.
-- For the CFG uncond pass, set `text_uncond_mask = 1.0` (zeros the text branch after the embed Linear, mirroring `mask_cond(force_mask=True)`); for the cond pass, set it to `0.0`. **No re-tokenization needed for the uncond pass.** This is wired up via a monkey-patched `mask_cond` at export time — see `closd/poc/export_onnx.py`.
+- For the CFG uncond pass, set `text_uncond_mask = 1.0` (zeros the text branch before the embed Linear, mirroring `mask_cond(force_mask=True)`); for the cond pass, set it to `0.0`. **No re-tokenization needed for the uncond pass — `text_mask` stays the same too.** This is wired up via a monkey-patched `mask_cond` at export time — see `closd/poc/export_onnx.py`.
 
 ## 3. Text encoder — separate from the trunk
 
-Lives in CLIP ViT-B/32 (`mdm.py:107-181`). For the port:
+The shipped DiP checkpoints (no-target, multi-target) **both use DistilBERT**, not CLIP. The CLIP code path in `mdm.py:114-118` exists but isn't taken — `text_encoder_type="bert"` in both `args.json` files. `closd/poc/SAMPLER_NOTES.md` originally assumed CLIP because that's what the parser default is; the actual checkpoint config overrides it.
 
-- **Use transformers.js** (`Xenova/clip-vit-base-patch32`) for tokenize + encode. WebGPU EP. Outputs the 512-dim text projection.
-- The Python path is `clip.tokenize(text, context_length=22, truncate=True)` then `clip_model.encode_text(...).float()` → `[B, 512]` → unsqueeze to `[1, B, 512]`. transformers.js produces the same 512-dim projection (verified once at load — see Day 5 task).
-- The 512→512 `embed_text` Linear and the `mask_cond` zeroing **stay inside the exported ONNX trunk**. So the TS pipeline is: `text → CLIP (transformers.js) → [1,1,512] → ONNX trunk input`.
-- For the **CFG uncond pass**: `mask_cond` zeros the text embedding when `text_uncond=True`. Equivalent in TS: pass a zero tensor of shape `[1,1,512]` as `text_embed` for the second pass. **No need to re-tokenize an empty string.**
+For the port:
 
-Tokenization context_length is 22 (`mdm.py:172` for HumanML3D). transformers.js default is 77; we need to either truncate to 22 or accept that CLIP itself zero-pads — they should produce identical pooled output because the [EOS] token's index drives the projection. Verify on Day 5.
+- **Use transformers.js** (`Xenova/distilbert-base-uncased`) for tokenize + encode. WebGPU EP. Outputs the full last-hidden-state sequence: `[B, T_text, 768]`. Permute to `[T_text, B, 768]` (seq-first) before feeding the ONNX trunk.
+- The Python path (`closd/diffusion_planner/model/BERT/BERT_encoder.py`):
+  ```python
+  enc = tokenizer(texts, return_tensors="pt", padding=True)        # input_ids, attention_mask
+  out = bert.text_model(**enc).last_hidden_state                   # [B, T_text, 768]
+  enc_text = out.permute(1, 0, 2)                                   # [T_text, B, 768]
+  text_mask = ~enc.attention_mask.to(dtype=bool)                    # True = padding (no token)
+  ```
+  Both `enc_text` and `text_mask` go into the ONNX trunk as separate inputs — `text_mask` becomes the cross-attention `memory_key_padding_mask`.
+- The 768→512 `embed_text` Linear and the `mask_cond` zeroing **stay inside the exported ONNX trunk**. The TS pipeline is: `text → DistilBERT (transformers.js) → (text_embed [T_text,1,768], text_mask [1,T_text]) → ONNX trunk input`.
+- For the **CFG uncond pass**: `text_uncond_mask = 1.0` zeros the text embedding inside the trunk. Equivalent observable behavior to `mask_cond(force_mask=True)`. **`text_embed` and `text_mask` are unchanged across the cond / uncond passes** — only `text_uncond_mask` flips.
+
+Tokenization padding is dynamic (DistilBERT's `padding=True` pads to the longest prompt in the batch). For B=1 inference, T_text is just the actual tokenized length of the prompt (e.g. 6 for `"a person walks forward"` → `[CLS] a person walks forward [SEP]`). The ONNX export declares T_text as a dynamic axis so any prompt length works at runtime.
+
+**Note for the browser**: transformers.js' `Xenova/distilbert-base-uncased` returns `last_hidden_state` directly. The earlier `Xenova/clip-vit-base-patch32` path mentioned in the original Day 5 plan **does not match** the shipped checkpoints — Day 5 needs to be revised to use DistilBERT.
 
 ## 4. Classifier-free guidance
 
@@ -87,9 +104,11 @@ return out_uncond + scale * (out_cond - out_uncond)
 
 **TS implementation** (`cfg.ts`):
 ```ts
-const xCond   = await session.run({ x, timesteps, text_embed: clipEmb, mask, prefix });
-const xUncond = await session.run({ x, timesteps, text_embed: zerosLike(clipEmb), mask, prefix });
-return uncond + scale * (cond - uncond);   // elementwise on the [1,263,1,60] tensor
+// text_embed and text_mask are computed once per prompt (DistilBERT) and reused.
+const common = { x, timesteps, text_embed, text_mask, mask, prefix };
+const cond   = await session.run({ ...common, text_uncond_mask: ZERO_F32 });   // 0.0 = condition
+const uncond = await session.run({ ...common, text_uncond_mask: ONE_F32 });    //  1.0 = uncondition
+return uncond + scale * (cond - uncond);   // elementwise on the [1,263,1,40] tensor
 ```
 
 `scale` is broadcast as `[B,1,1,1]` in Python (`sampler_util.py:31`) — for B=1 it's a scalar. Default `7.5`.
@@ -212,7 +231,8 @@ export const CONFIG = {
     nFrames: { context: 20, predict: 40, total: 196 },
     featureDim: 263,                    // HumanML3D
     latentDim: 512,
-    clipDim: 512,
+    textEmbedDim: 768,                  // DistilBERT last_hidden_state dim
+    textTokenizer: 'Xenova/distilbert-base-uncased',
     guidanceScale: 7.5,                 // CFG default
     arIterations: 5,                    // (196 / 40) + 1
     eta: 0.0,                           // deterministic DDIM
@@ -246,21 +266,21 @@ function cosineBetas(N: number, maxBeta = 0.999): number[] {
 
 ## 11. Decision-ready notes for export (Day 2)
 
-- Export with `torch.onnx.export(..., opset_version=17, do_constant_folding=True, dynamic_axes=None)`. Fixed shapes: `B=1, T_pred=40`. ORT Web's WebGPU EP supports opset 17 well.
-- If `torch.onnx.export` fails on a multi-head attention op, fall back to `torch.onnx.dynamo_export` (PyTorch 2.x). If that also fails — **Day 3 hard stop, escalate, see plan §"Decision points"**.
-- FP16: export FP32, then convert with `onnxconverter_common.float16_converter.convert_float_to_float16`. Tolerance for parity goes from `1e-4` (FP32) to `1e-3` (FP16) per the success criteria.
-- **Do not** export the CLIP model. transformers.js handles it.
+- Export with `torch.onnx.export(..., opset_version=17, do_constant_folding=True, dynamic_axes={'text_embed': {0: 'T_text'}, 'text_mask': {1: 'T_text'}})`. Other shapes are fixed: `B=1, T_pred=40`. ORT Web's WebGPU EP supports opset 17 well.
+- If `torch.onnx.export` fails on a multi-head attention op, fall back to `torch.onnx.export(..., dynamo=True)` (PyTorch 2.5+; the older `torch.onnx.dynamo_export` is gone). If that also fails — **Day 3 hard stop, escalate, see plan §"Decision points"**.
+- FP16: export FP32, then convert with `onnxconverter_common.float16.convert_float_to_float16`. **Pass `node_block_list` for `Cast`/`Div` nodes inside `self_attn`/`multihead_attn`** — `onnxconverter_common 1.16` has a known type-inference bug where MultiheadAttention's internal Cast/Div pairs end up with mixed FP16/FP32 types that ORT rejects on load. The block list is generated automatically in `closd/poc/export_onnx.py`. Tolerance for parity goes from `1e-4` (FP32) to `1e-3` (FP16); we measure ~3e-4 mean-abs-err per step.
+- **Do not** export the text encoder. transformers.js (DistilBERT) handles it in the browser.
 - **Do** verify the exported ONNX with `onnxruntime` (Python) before checking it into the repo: same input → same output as the PyTorch model within `1e-5` (CPU FP32 path).
 
 ## 12. Gotchas (don't lose a day to these)
 
 1. **Model strips the prefix internally** — output is `[1,263,1,40]`, not 60. No slicing in TS.
-2. **`text_uncond` is implemented inside the ONNX trunk via the `text_uncond_mask` input** (a `[1]` float). Set to `0.0` for the cond pass, `1.0` for the uncond pass. The exported graph monkey-patches `mask_cond` so the runtime tensor drives the zeroing — `text_embed` is the real CLIP output in both passes.
+2. **`text_uncond` is implemented inside the ONNX trunk via the `text_uncond_mask` input** (a `[1]` float). Set to `0.0` for the cond pass, `1.0` for the uncond pass. The exported graph monkey-patches `mask_cond` so the runtime tensor drives the zeroing — `text_embed` and `text_mask` are the real DistilBERT outputs in both passes.
 3. **DDIM eta=0 means no noise term** — the line `mean_pred + nonzero_mask * sigma * noise` reduces to just `mean_pred` with `sigma=0`. Don't forget this when transcribing.
 4. **`clip_denoised=False`** for DiP — do NOT clamp `pred_xstart` to [-1,1]. The HumanML3D feature space exceeds that range and clamping silently corrupts.
 5. **Timestep tensor is int64** in PyTorch ONNX exports. ORT Web requires `BigInt64Array` for int64 inputs — use `new BigInt64Array([BigInt(t)])`, not `Int32Array`.
 6. **Mask is bool**, but ONNX bool tensors take `Uint8Array` (`new Uint8Array([1,1,...])`) — don't pass `Float32Array` here, will silently broadcast wrong.
-7. **CLIP tokenization context_length=22** in HumanML3D path; transformers.js may default to 77. Either truncate explicitly or verify the projection is invariant (the `[EOS]` token determines the pooled output, so truncation past the prompt's actual length is usually a no-op — verify on Day 5).
+7. ~~CLIP tokenization context_length=22~~ **DistilBERT** is the actual encoder used by both shipped checkpoints. Tokenization uses the BERT tokenizer with `padding=True` (longest in batch). For B=1 inference, T_text equals the prompt's tokenized length. The ONNX trunk consumes a dynamic-axis `text_embed [T_text, 1, 768]` plus a `text_mask [1, T_text]` — see §3.
 8. **`autoregressive_include_prefix=False`** for the standard demo — first 20 frames in the output are from the data prefix; user should NOT see them.
 9. **CFG `scale` shape is `[B,1,1,1]`** in PyTorch broadcast. For B=1 it's just a scalar in TS; keep it scalar.
 10. **No learned null token** — `mask_cond` zeros the text embedding on the **output** side of the `embed_text` Linear (per `mdm.py:233`, default `emb_before_mask=False`). The export script monkey-patches `mask_cond` to apply the runtime `text_uncond_mask` tensor at that exact spot, preserving the original semantics regardless of `emb_before_mask`.

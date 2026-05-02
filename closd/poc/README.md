@@ -34,7 +34,12 @@ If the conda env doesn't have onnx tooling installed, the export script falls ba
 
 ### Step 2 — browser-side parity tests (Days 3–6)
 
-Not yet implemented. Will be in `closd/poc/web/`.
+Implemented in `closd/poc/web/`. **Note**: the original Day 5 plan used CLIP via `Xenova/clip-vit-base-patch32` for text encoding, but the shipped DiP checkpoints actually use **DistilBERT** (`text_encoder_type: "bert"` in their `args.json`). The ONNX trunk now expects:
+
+- `text_embed`: `[T_text, 1, 768]` float32 (DistilBERT `last_hidden_state`, permuted to seq-first)
+- `text_mask`: `[1, T_text]` bool (True = padding token)
+
+The browser must run DistilBERT (e.g. `Xenova/distilbert-base-uncased` via transformers.js) and feed both tensors into the ONNX session. See [SAMPLER_NOTES.md §3](./SAMPLER_NOTES.md) for the full contract.
 
 ## Phase 2 (Days 8–14): tool-suite extension
 

@@ -14,7 +14,12 @@ What gets exported:
 Trunk inputs (see closd/poc/SAMPLER_NOTES.md §2):
   x                : [1, 263, 1, 40]   float32   noisy predict-region tensor at timestep t
   timesteps        : [1]                int64     value 0..9 for the 10-step model
-  text_embed       : [1, 1, 512]        float32   pre-encoded CLIP output
+  text_embed       : [T_text, 1, D_txt] float32   pre-encoded text encoder output
+                                                  (DistilBERT last_hidden_state, permuted to seq-first)
+                                                  D_txt = 768 for BERT, 512 for CLIP
+                                                  T_text dynamic (BERT pads to longest in batch)
+  text_mask        : [1, T_text]        bool      True = padding token (no content)
+                                                  All False for CLIP (single pooled token).
   mask             : [1, 1, 1, 40]      bool      validity of predict frames (1=valid)
   prefix           : [1, 263, 1, 20]    float32   rolling context from AR loop
   text_uncond_mask : [1]                float32   1.0 = uncond pass (zero text), 0.0 = cond pass
@@ -22,6 +27,12 @@ Trunk inputs (see closd/poc/SAMPLER_NOTES.md §2):
 Output:
   pred_xstart : [1, 263, 1, 40]   float32   model's x_start prediction over predict region
                                             (mdm.forward strips the 20 prefix frames internally)
+
+Note on text encoder:
+  Both shipped DiP checkpoints (no-target, multi-target) use DistilBERT — clip_dim=768.
+  The browser must run DistilBERT (e.g. via transformers.js with Xenova/distilbert-base-uncased)
+  and feed the variable-length last_hidden_state + attention_mask. The earlier CLIP-shape
+  contract (text_embed [1,1,512], no text_mask) is invalid for these checkpoints.
 
 Implementation note:
   We delegate to the real MDM.forward rather than re-implementing it, then monkey-patch
@@ -70,7 +81,7 @@ class TrunkWrapper(nn.Module):
         super().__init__()
         self.mdm = mdm
 
-    def forward(self, x, timesteps, text_embed, mask, prefix, text_uncond_mask):
+    def forward(self, x, timesteps, text_embed, text_mask, mask, prefix, text_uncond_mask):
         m = self.mdm
 
         # Patch mask_cond to use the runtime tensor. We bind a method that
@@ -85,11 +96,12 @@ class TrunkWrapper(nn.Module):
         original = m.mask_cond
         m.mask_cond = types.MethodType(patched_mask_cond, m)
 
-        # Build the y dict MDM.forward expects. We avoid mutating caller-owned
-        # tensors by cloning mask before passing in (mdm.forward concatenates
-        # prefix-mask onto y['mask'] in place).
+        # MDM.forward unpacks `y['text_embed']` as a tuple when text_encoder_type
+        # is 'bert' (see mdm.py:222-227 — `if type(enc_text) == tuple`). For BERT
+        # we pass (text_embed, text_mask); for CLIP a bare tensor would also work
+        # but every shipped DiP checkpoint uses BERT so we standardize on the tuple.
         y = {
-            "text_embed": text_embed,
+            "text_embed": (text_embed, text_mask),
             "mask": mask.clone(),
             "prefix": prefix,
             "lengths": torch.tensor([x.shape[-1]], device=x.device),
@@ -173,21 +185,31 @@ def export(ckpt_id: str, fp16: bool = False):
     T_pred = args.pred_len
     T_ctx = args.context_len
     F = 263
-    C = 512
+    # Text encoder dim: 768 for BERT, 512 for CLIP. Read off the loaded model so
+    # the export matches the checkpoint regardless of which encoder it trained with.
+    D_txt = int(model.clip_dim)
+    # Tracing uses a single dummy text length; runtime accepts any length via the
+    # T_text dynamic axis declared below. Using 6 here = "[CLS] a person walks forward [SEP]".
+    T_text = 6
 
     dummy_x = torch.zeros(B, F, 1, T_pred, dtype=torch.float32)
     dummy_timesteps = torch.zeros(B, dtype=torch.int64)
-    dummy_text_embed = torch.zeros(1, B, C, dtype=torch.float32)
+    dummy_text_embed = torch.zeros(T_text, B, D_txt, dtype=torch.float32)
+    dummy_text_mask = torch.zeros(B, T_text, dtype=torch.bool)
     dummy_mask = torch.ones(B, 1, 1, T_pred, dtype=torch.bool)
     dummy_prefix = torch.zeros(B, F, 1, T_ctx, dtype=torch.float32)
     dummy_text_uncond = torch.zeros(1, dtype=torch.float32)
 
     inputs = (
-        dummy_x, dummy_timesteps, dummy_text_embed,
+        dummy_x, dummy_timesteps, dummy_text_embed, dummy_text_mask,
         dummy_mask, dummy_prefix, dummy_text_uncond,
     )
-    input_names = ["x", "timesteps", "text_embed", "mask", "prefix", "text_uncond_mask"]
+    input_names = ["x", "timesteps", "text_embed", "text_mask", "mask", "prefix", "text_uncond_mask"]
     output_names = ["pred_xstart"]
+    dynamic_axes = {
+        "text_embed": {0: "T_text"},
+        "text_mask": {1: "T_text"},
+    }
 
     print(f"[export] running torch.onnx.export → {out_fp32}")
     try:
@@ -200,14 +222,25 @@ def export(ckpt_id: str, fp16: bool = False):
                 output_names=output_names,
                 opset_version=17,
                 do_constant_folding=True,
-                dynamic_axes=None,
+                dynamic_axes=dynamic_axes,
+                dynamo=False,
             )
     except Exception as e:
         print(f"[export] torch.onnx.export failed: {e}")
-        print("[export] retrying with torch.onnx.dynamo_export (PyTorch 2.x)")
+        # PyTorch 2.5+ removed `dynamo_export`; the dynamo path is now driven via
+        # `dynamo=True` on `torch.onnx.export`. Try that as a fallback.
+        print("[export] retrying with torch.onnx.export(dynamo=True)")
         with torch.no_grad():
-            ep = torch.onnx.dynamo_export(wrapper, *inputs)
-            ep.save(str(out_fp32))
+            torch.onnx.export(
+                wrapper,
+                inputs,
+                str(out_fp32),
+                input_names=input_names,
+                output_names=output_names,
+                opset_version=17,
+                dynamic_axes=dynamic_axes,
+                dynamo=True,
+            )
 
     # CPU sanity check: ORT FP32 must match PyTorch FP32 to within ~1e-5
     try:
@@ -229,7 +262,19 @@ def export(ckpt_id: str, fp16: bool = False):
         from onnxconverter_common.float16 import convert_float_to_float16
         import onnx
         m = onnx.load(str(out_fp32))
-        m_fp16 = convert_float_to_float16(m, keep_io_types=True)
+        # onnxconverter_common 1.16 has a known type-inference bug around the
+        # MultiheadAttention internals that torch.onnx emits (Cast/Div pairs in
+        # self_attn / multihead_attn produce mixed float16/float types that ORT
+        # rejects on load). Keeping these specific nodes in FP32 sidesteps the bug
+        # and only adds ~5MB to the FP16 model. Validated: load + parity OK.
+        attn_node_block = [
+            n.name for n in m.graph.node
+            if ("self_attn" in n.name or "multihead_attn" in n.name)
+            and n.op_type in ("Cast", "Div")
+        ]
+        m_fp16 = convert_float_to_float16(
+            m, keep_io_types=True, node_block_list=attn_node_block,
+        )
         onnx.save(m_fp16, str(out_fp16))
 
     print(f"[export] done. artifacts in {ARTIFACTS_DIR}")
