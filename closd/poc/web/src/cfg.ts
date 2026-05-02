@@ -48,9 +48,13 @@ export async function runCfgStep(
     prefix: inputs.prefix,
   };
 
-  const condPromise = session.run({ ...baseInputs, textUncondMask: 0 });
-  const uncondPromise = session.run({ ...baseInputs, textUncondMask: 1 });
-  const [cond, uncond] = await Promise.all([condPromise, uncondPromise]);
+  // ORT-Web sessions can't be invoked concurrently — `session.run()` is
+  // serialized internally and a second concurrent call throws
+  // "Session already started". So even though cond + uncond are
+  // independent we have to await them sequentially. Total wall time
+  // is ~2x but correctness > parallelism.
+  const cond = await session.run({ ...baseInputs, textUncondMask: 0 });
+  const uncond = await session.run({ ...baseInputs, textUncondMask: 1 });
 
   if (tap) tap(cond, uncond);
 
