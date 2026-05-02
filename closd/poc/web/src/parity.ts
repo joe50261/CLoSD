@@ -222,6 +222,20 @@ export async function runParity(
         passed: mae(refXt, x) < threshold,
       });
 
+      // Tap cond/uncond pre-CFG outputs for diagnostics. Whether the model
+      // export itself is faithful determines if these checks pass; whether
+      // CFG is wired up correctly determines if pred_xstart passes when
+      // cond/uncond do.
+      const refCond = await fetchNpy(
+        FIX(opts.fixturesBaseUrl, `iter0/cond_step${stepName}.npy`),
+      ).catch(() => null);
+      const refUncond = await fetchNpy(
+        FIX(opts.fixturesBaseUrl, `iter0/uncond_step${stepName}.npy`),
+      ).catch(() => null);
+
+      let condMae = NaN;
+      let uncondMae = NaN;
+      let condUncondDiff = NaN;
       const predXstart = await runCfgStep(
         session,
         {
@@ -233,7 +247,38 @@ export async function runParity(
           prefix,
         },
         DEFAULT_CONFIG.guidanceScale,
+        (cond, uncond) => {
+          if (refCond) condMae = mae(refCond, cond);
+          if (refUncond) uncondMae = mae(refUncond, uncond);
+          condUncondDiff = mae(cond, uncond);
+        },
       );
+
+      if (refCond) {
+        checks.push({
+          name: `iter0/cond_step${stepName}`,
+          mae: condMae,
+          threshold,
+          passed: condMae < threshold,
+        });
+      }
+      if (refUncond) {
+        checks.push({
+          name: `iter0/uncond_step${stepName}`,
+          mae: uncondMae,
+          threshold,
+          passed: uncondMae < threshold,
+        });
+      }
+      // Diagnostic: cond and uncond should differ if CFG branching works.
+      // If this MAE is ~0, cond pass and uncond pass are producing identical
+      // output and CFG degenerates to just cond.
+      checks.push({
+        name: `iter0/cond_vs_uncond_step${stepName} (should be > threshold)`,
+        mae: condUncondDiff,
+        threshold,
+        passed: condUncondDiff > threshold,
+      });
 
       const refPred = await fetchNpy(
         FIX(opts.fixturesBaseUrl, `iter0/pred_xstart_step${stepName}.npy`),
