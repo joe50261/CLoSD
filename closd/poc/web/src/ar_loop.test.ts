@@ -49,7 +49,8 @@ describe("autoregressiveSample", () => {
     await autoregressiveSample(
       session,
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
       },
       { config: cfg, seed: 42 },
@@ -63,7 +64,8 @@ describe("autoregressiveSample", () => {
     const out = await autoregressiveSample(
       makeMockTrunk(),
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
       },
       { config: cfg, seed: 42 },
@@ -76,7 +78,8 @@ describe("autoregressiveSample", () => {
     const out = await autoregressiveSample(
       makeMockTrunk(),
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
       },
       { config: cfg, seed: 42 },
@@ -88,7 +91,8 @@ describe("autoregressiveSample", () => {
     const out = await autoregressiveSample(
       makeMockTrunk(),
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
       },
       { config: cfg, seed: 42, includePrefix: true },
@@ -101,7 +105,8 @@ describe("autoregressiveSample", () => {
     await autoregressiveSample(
       makeMockTrunk(),
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
       },
       {
@@ -135,7 +140,8 @@ describe("autoregressiveSample", () => {
       release() {},
     };
     const args = {
-      textEmbed: zeros([1, 1, 512]) as T4,
+      textEmbed: zeros([6, 1, 768]) as T4,
+      textMask: zeros([1, 6]) as T4,
       initialPrefix: zeros([1, 263, 1, 20]) as T4,
     };
     const a = await autoregressiveSample(trunk, args, { config: cfg, seed: 7 });
@@ -154,7 +160,8 @@ describe("autoregressiveSample", () => {
       release() {},
     };
     const args = {
-      textEmbed: zeros([1, 1, 512]) as T4,
+      textEmbed: zeros([6, 1, 768]) as T4,
+      textMask: zeros([1, 6]) as T4,
       initialPrefix: zeros([1, 263, 1, 20]) as T4,
     };
     const a = await autoregressiveSample(trunk, args, { config: cfg, seed: 7 });

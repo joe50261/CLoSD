@@ -16,7 +16,8 @@ import { axpby, T4 } from "./tensor.js";
 export interface CfgInputs {
   x: T4;                  // [1, 263, 1, 40]
   timestep: number;       // 0..9
-  textEmbed: T4;          // [1, 1, 512] cached CLIP output (cond pass)
+  textEmbed: T4;          // [T_text, 1, 768] DistilBERT last_hidden_state, seq-first
+  textMask: T4;           // [1, T_text] bool, True = padding
   mask: T4;               // [1, 1, 1, 40] validity mask, treated as bool by ORT
   prefix: T4;             // [1, 263, 1, 20] AR rolling prefix
 }
@@ -42,6 +43,7 @@ export async function runCfgStep(
     x: inputs.x,
     timestep: inputs.timestep,
     textEmbed: inputs.textEmbed,
+    textMask: inputs.textMask,
     mask: inputs.mask,
     prefix: inputs.prefix,
   };

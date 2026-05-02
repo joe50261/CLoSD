@@ -5,15 +5,19 @@
 // doesn't depend on ort types — makes parity tests trivial to mock.
 //
 // Critical inputs/outputs match the export script's contract
-// (see closd/poc/export_onnx.py docstring and SAMPLER_NOTES.md §2):
+// (see closd/poc/export_onnx.py docstring and SAMPLER_NOTES.md §2 + §3):
 //   x          : float32 [1, 263, 1, 40]
 //   timesteps  : int64   [1]
-//   text_embed : float32 [1, 1, 512]
+//   text_embed : float32 [T_text, 1, 768]   (DistilBERT last_hidden_state, seq-first)
+//   text_mask  : bool    [1, T_text]        (True = padding token)
 //   mask       : bool    [1, 1, 1, 40]
 //   prefix     : float32 [1, 263, 1, 20]
 //   text_uncond_mask : float32 [1]
 //
 //   pred_xstart : float32 [1, 263, 1, 40]
+//
+// T_text is a dynamic axis — the BERT tokenizer pads to the longest prompt
+// in the batch. For B=1 it's just the prompt's tokenized length.
 
 import * as ort from "onnxruntime-web";
 import type { T4 } from "./tensor.js";
@@ -21,7 +25,10 @@ import type { T4 } from "./tensor.js";
 export interface TrunkInputs {
   x: T4;
   timestep: number;
+  /** [T_text, 1, 768] DistilBERT last_hidden_state, seq-first. */
   textEmbed: T4;
+  /** [1, T_text] bool, True = padding token. */
+  textMask: T4;
   mask: T4;
   prefix: T4;
   textUncondMask: number; // 0 or 1
@@ -69,16 +76,15 @@ export async function loadTrunk(opts: LoadOptions): Promise<TrunkSession> {
       [1],
     );
     // bool tensors take Uint8Array — see SAMPLER_NOTES.md gotcha #6.
-    const maskU8 = new Uint8Array(inputs.mask.data.length);
-    for (let i = 0; i < inputs.mask.data.length; i++) {
-      maskU8[i] = inputs.mask.data[i]! > 0 ? 1 : 0;
-    }
+    const maskU8 = boolTensorBytes(inputs.mask);
+    const textMaskU8 = boolTensorBytes(inputs.textMask);
     const feeds: Record<string, ort.Tensor> = {
       x: new ort.Tensor("float32", inputs.x.data, [...inputs.x.shape]),
       timesteps,
       text_embed: new ort.Tensor("float32", inputs.textEmbed.data, [
         ...inputs.textEmbed.shape,
       ]),
+      text_mask: new ort.Tensor("bool", textMaskU8, [...inputs.textMask.shape]),
       mask: new ort.Tensor("bool", maskU8, [...inputs.mask.shape]),
       prefix: new ort.Tensor("float32", inputs.prefix.data, [
         ...inputs.prefix.shape,
@@ -110,4 +116,12 @@ export async function loadTrunk(opts: LoadOptions): Promise<TrunkSession> {
     run,
     release: () => session.release(),
   };
+}
+
+function boolTensorBytes(t: T4): Uint8Array {
+  const out = new Uint8Array(t.data.length);
+  for (let i = 0; i < t.data.length; i++) {
+    out[i] = t.data[i]! > 0 ? 1 : 0;
+  }
+  return out;
 }

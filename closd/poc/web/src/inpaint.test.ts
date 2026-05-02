@@ -91,7 +91,8 @@ describe("autoregressiveSampleWithInpainting", () => {
     const out = await autoregressiveSampleWithInpainting(
       makeIdentityTrunk(),
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
         referenceMotion: zeros([1, 263, 1, 196]),
         inpaintingMask: zeros([1, 263, 1, 196]),
@@ -127,7 +128,8 @@ describe("autoregressiveSampleWithInpainting", () => {
     const out = await autoregressiveSampleWithInpainting(
       trunk,
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
         referenceMotion: reference,
         inpaintingMask: mask,
@@ -170,7 +172,8 @@ describe("autoregressiveSampleWithInpainting", () => {
     await autoregressiveSampleWithInpainting(
       session,
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
         referenceMotion: zeros([1, 263, 1, 196]),
         inpaintingMask: zeros([1, 263, 1, 196]),
@@ -208,7 +211,8 @@ describe("autoregressiveSampleWithInpainting", () => {
     const out = await autoregressiveSampleWithInpainting(
       trunk,
       {
-        textEmbed: zeros([1, 1, 512]),
+        textEmbed: zeros([6, 1, 768]),
+        textMask: zeros([1, 6]),
         initialPrefix: zeros([1, 263, 1, 20]),
         referenceMotion: reference,
         inpaintingMask: mask,

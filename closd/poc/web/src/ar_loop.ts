@@ -27,8 +27,12 @@ import {
 } from "./tensor.js";
 
 export interface ArInputs {
-  textEmbed: T4;        // [1, 1, 512] cached CLIP encoding
-  initialPrefix: T4;    // [1, 263, 1, context_len] seed prefix
+  /** [T_text, 1, 768] cached DistilBERT last_hidden_state, seq-first. */
+  textEmbed: T4;
+  /** [1, T_text] bool, True = padding token. */
+  textMask: T4;
+  /** [1, 263, 1, context_len] seed prefix. */
+  initialPrefix: T4;
 }
 
 export interface ArOptions {
@@ -51,6 +55,7 @@ export interface ArOptions {
 async function denoiseLoop(
   session: TrunkSession,
   textEmbed: T4,
+  textMask: T4,
   prefix: T4,
   config: DiPConfig,
   rng: SeededRng,
@@ -59,13 +64,16 @@ async function denoiseLoop(
   iterIdx: number,
 ): Promise<T4> {
   const schedule = buildSchedule(config.nDiffusionSteps);
-  const shape = [1, config.featureDim, 1, config.nFramesPredict] as const;
+  const xShape = [1, config.featureDim, 1, config.nFramesPredict] as const;
 
   // Initial noise.
-  let x: T4 = randnT4(shape, rng);
-  // Validity mask: all 40 predict frames are valid (we don't pad in the PoC).
+  let x: T4 = randnT4(xShape, rng);
+  // Frame validity mask: shape [1, 1, 1, T_pred] bool — all predict frames
+  // are valid for the PoC (we don't pad). The trunk checks mask shape
+  // (mdm.py:254 `is_valid_mask = y['mask'].shape[-1] > 1`), so feeding
+  // a wrong-shape mask would either error or be silently broadcast wrong.
   const mask: T4 = (() => {
-    const m = zeros(shape);
+    const m = zeros([1, 1, 1, config.nFramesPredict]);
     m.data.fill(1);
     return m;
   })();
@@ -76,7 +84,7 @@ async function denoiseLoop(
 
     const predXstart = await runCfgStep(
       session,
-      { x, timestep: t, textEmbed, mask, prefix },
+      { x, timestep: t, textEmbed, textMask, mask, prefix },
       config.guidanceScale,
       onTap ? (cond, uncond) => onTap(iterIdx, stepIdx, cond, uncond) : undefined,
     );
@@ -110,6 +118,7 @@ export async function autoregressiveSample(
     const sample = await denoiseLoop(
       session,
       inputs.textEmbed,
+      inputs.textMask,
       prefix,
       cfg,
       rng,

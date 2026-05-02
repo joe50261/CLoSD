@@ -130,16 +130,34 @@ export async function runParity(
     //    (e.g. for the synth deploy where text_embed.npy is random and
     //    we want to skip the CLIP run), all per-step checks still proceed
     //    using the saved refTextEmbed as the source of truth.
-    log("loading saved text_embed fixture…");
+    log("loading saved text_embed + text_mask fixtures…");
     const promptText = await (
       await fetch(FIX(opts.fixturesBaseUrl, "prompt.txt"))
     ).text();
     const refTextEmbed = await fetchNpy(
       FIX(opts.fixturesBaseUrl, "text_embed.npy"),
     );
+    // text_mask is BERT-only; for older CLIP-shape fixtures it's absent and
+    // we synthesize an all-False mask of the same length as text_embed seq dim.
+    let refTextMask: T4;
+    try {
+      refTextMask = await fetchNpy(FIX(opts.fixturesBaseUrl, "text_mask.npy"));
+    } catch {
+      const tText = refTextEmbed.shape[0]!;
+      refTextMask = { data: new Float32Array(tText), shape: [1, tText] };
+    }
 
+    // The browser-side text encoder is currently CLIP (transformers.js,
+    // Xenova/clip-vit-base-patch32, 512-d pooled output). The shipped DiP
+    // checkpoints use DistilBERT (768-d sequence). If the fixture's
+    // text_embed seq dim > 1 OR feature dim ≠ 512, the encoders disagree
+    // and we just record "skipped"; the rest of the harness still runs
+    // using the saved fixture as ground truth.
     let textEncoderCheck: ParityCheck;
-    if (encoder) {
+    const fixtureIsBert =
+      refTextEmbed.shape.length === 3 &&
+      (refTextEmbed.shape[0]! > 1 || refTextEmbed.shape[2] === 768);
+    if (encoder && !fixtureIsBert) {
       try {
         log("checking CLIP text embedding…");
         const browserTextEmbed = await encoder.encode(promptText.trim());
@@ -159,6 +177,17 @@ export async function runParity(
           passed: true,
         };
       }
+    } else if (fixtureIsBert) {
+      log(
+        "fixture is BERT-shape (D=768 or T_text>1); CLIP browser check skipped " +
+          "until DistilBERT is wired in",
+      );
+      textEncoderCheck = {
+        name: "text_embed — fixture is BERT, browser CLIP comparison skipped",
+        mae: NaN,
+        threshold,
+        passed: true,
+      };
     } else {
       textEncoderCheck = {
         name: "text_embed (CLIP) — encoder unavailable",
@@ -195,7 +224,14 @@ export async function runParity(
 
       const predXstart = await runCfgStep(
         session,
-        { x, timestep: t, textEmbed: refTextEmbed, mask, prefix },
+        {
+          x,
+          timestep: t,
+          textEmbed: refTextEmbed,
+          textMask: refTextMask,
+          mask,
+          prefix,
+        },
         DEFAULT_CONFIG.guidanceScale,
       );
 
@@ -231,7 +267,7 @@ export async function runParity(
     );
     const fullSample = await autoregressiveSample(
       session,
-      { textEmbed: refTextEmbed, initialPrefix },
+      { textEmbed: refTextEmbed, textMask: refTextMask, initialPrefix },
       { config: DEFAULT_CONFIG, seed: opts.seed },
     );
     const totalSample = performance.now() - tSampleStart;

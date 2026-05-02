@@ -33,7 +33,10 @@ import {
 } from "./tensor.js";
 
 export interface InpaintInputs {
-  textEmbed: T4;                  // [1, 1, 512]
+  /** [T_text, 1, 768] DistilBERT last_hidden_state, seq-first. */
+  textEmbed: T4;
+  /** [1, T_text] bool, True = padding token. */
+  textMask: T4;
   initialPrefix: T4;              // [1, 263, 1, context_len]
   /**
    * Reference motion. Two supported shapes:
@@ -86,6 +89,7 @@ function sliceForIter(
 async function denoiseLoopWithInpaint(
   session: TrunkSession,
   textEmbed: T4,
+  textMask: T4,
   prefix: T4,
   iterReference: T4,
   iterMask: T4,
@@ -96,11 +100,12 @@ async function denoiseLoopWithInpaint(
   iterIdx: number,
 ): Promise<T4> {
   const schedule = buildSchedule(config.nDiffusionSteps);
-  const shape = [1, config.featureDim, 1, config.nFramesPredict] as const;
+  const xShape = [1, config.featureDim, 1, config.nFramesPredict] as const;
 
-  let x: T4 = randnT4(shape, rng);
+  let x: T4 = randnT4(xShape, rng);
+  // [1, 1, 1, T_pred] frame validity mask (NOT the inpainting mask).
   const mask: T4 = (() => {
-    const m = zeros(shape);
+    const m = zeros([1, 1, 1, config.nFramesPredict]);
     m.data.fill(1);
     return m;
   })();
@@ -111,7 +116,7 @@ async function denoiseLoopWithInpaint(
 
     let predXstart = await runCfgStep(
       session,
-      { x, timestep: t, textEmbed, mask, prefix },
+      { x, timestep: t, textEmbed, textMask, mask, prefix },
       config.guidanceScale,
       onTap ? (cond, uncond) => onTap(iterIdx, stepIdx, cond, uncond) : undefined,
     );
@@ -155,6 +160,7 @@ export async function autoregressiveSampleWithInpainting(
     const sample = await denoiseLoopWithInpaint(
       session,
       inputs.textEmbed,
+      inputs.textMask,
       prefix,
       ref,
       m,
