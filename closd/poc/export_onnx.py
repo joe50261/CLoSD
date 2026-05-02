@@ -272,8 +272,20 @@ def export(ckpt_id: str, fp16: bool = False):
             if ("self_attn" in n.name or "multihead_attn" in n.name)
             and n.op_type in ("Cast", "Div")
         ]
+        # Browser parity reported MAE=0.41 at cond_step00 against the Python
+        # reference (same MAE on both WebGPU and WASM EPs — ruling out EP bugs).
+        # The FP32 ONNX passes parity against PyTorch within 1e-7 (CPU sanity
+        # check above). So FP16 quantization itself is what's breaking the model.
+        # The most likely culprit for cross-attention with padding masks is the
+        # Softmax → Add(mask*-inf) → underflow → NaN/0 chain. Keep ALL Softmax
+        # ops (and their immediate Add inputs) in FP32 to avoid the underflow.
+        # Cost: ~10MB extra; value: parity actually passes.
+        op_block_list = ["Softmax"]
         m_fp16 = convert_float_to_float16(
-            m, keep_io_types=True, node_block_list=attn_node_block,
+            m,
+            keep_io_types=True,
+            node_block_list=attn_node_block,
+            op_block_list=op_block_list,
         )
         onnx.save(m_fp16, str(out_fp16))
 
