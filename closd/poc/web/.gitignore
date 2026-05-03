@@ -1,0 +1,10 @@
+# Local override of the repo root .gitignore which globally excludes *.json.
+# These are project config files and must be tracked.
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Build outputs (still ignored)
+node_modules/
+dist/
+.vite/

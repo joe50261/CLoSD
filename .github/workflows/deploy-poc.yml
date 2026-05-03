@@ -1,0 +1,93 @@
+name: Deploy PoC to GitHub Pages
+
+on:
+  # Pages source is "Deploy from a branch / root", which means GitHub also
+  # auto-runs its pages-build-deployment workflow on every push. Both that
+  # workflow and this one call actions/deploy-pages@v4 — they race, and the
+  # one that completes LAST wins the deploy. If we use a paths filter and
+  # the touched files don't match it, only GitHub's auto workflow runs and
+  # serves the (no-index.html) branch root → site 404s. The fix is to drop
+  # the paths filter so this workflow runs on every push and reliably
+  # produces the dist override after GitHub's auto workflow.
+  push:
+    branches: [main, "claude/project-overview-docs-FScIt"]
+  workflow_dispatch:
+
+# Only one deploy at a time; cancel in-progress runs on new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: closd/poc/web/package-lock.json
+
+      - name: npm ci
+        working-directory: closd/poc/web
+        run: npm ci
+
+      # Stage artifacts and fixtures into public/ so they're served at
+      # /CLoSD/artifacts/* and /CLoSD/fixtures/*. Both source dirs are
+      # gitignored at closd/poc level — must have been produced by
+      # export_onnx.py / generate_fixtures.py and force-committed, or
+      # be fetched in a CI step ahead of this one.
+      - name: Stage artifacts and fixtures
+        working-directory: closd/poc/web
+        run: |
+          mkdir -p public
+          if [ -d "../artifacts" ]; then
+            cp -rL ../artifacts public/artifacts
+            echo "Staged artifacts:"
+            ls -lh public/artifacts
+          else
+            echo "No artifacts/ directory — page will 404 on .onnx fetch."
+          fi
+          if [ -d "../fixtures" ]; then
+            cp -rL ../fixtures public/fixtures
+            echo "Staged fixtures:"
+            find public/fixtures -maxdepth 2 -type d
+          else
+            echo "No fixtures/ directory — page will 404 on .npy fetch."
+          fi
+
+      - name: Build
+        working-directory: closd/poc/web
+        env:
+          VITE_BASE: /CLoSD/
+        run: npm run build
+
+      # Print what's actually in dist so the artifact contents are visible
+      # in CI logs (helps diagnose path issues like the previous 404).
+      - name: Show dist contents
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la closd/poc/web/dist/
+          echo "---"
+          find closd/poc/web/dist -maxdepth 3 -type f | head -30
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: closd/poc/web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
